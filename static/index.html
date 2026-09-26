@@ -6,29 +6,178 @@
   <title>植物病虫害检疫与传播追溯</title>
   <style>
     body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; margin: 2rem; color: #1f2937; }
-    main { max-width: 820px; margin: auto; }
+    main { max-width: 960px; margin: auto; }
     pre { background: #f3f4f6; padding: 1rem; border-radius: 8px; overflow-x: auto; }
     button { padding: .5rem .8rem; cursor: pointer; }
+    table { border-collapse: collapse; width: 100%; margin: 1rem 0; }
+    th, td { border: 1px solid #e5e7eb; padding: .4rem .6rem; text-align: left; font-size: .95rem; vertical-align: top; }
+    th { background: #f9fafb; }
+    .status-quarantined { color: #b91c1c; font-weight: 600; }
+    .status-destroyed { color: #6b7280; }
+    .status-released { color: #047857; }
+    .muted { color: #6b7280; }
+    input { padding: .4rem; }
   </style>
 </head>
 <body>
 <main>
   <h1>植物病虫害检疫与传播追溯</h1>
-  <p>这是最小演示页面。使用浏览器或 curl 调用 JSON API。</p>
   <p><button onclick="checkHealth()">检查服务状态</button></p>
-  <pre id="result">等待操作</pre>
+
+  <h2>传播链台账</h2>
+  <p>
+    <button onclick="loadChains()">刷新传播链</button>
+    <span class="muted" id="chainsHint"></span>
+  </p>
+  <div id="chains"><p class="muted">点击“刷新传播链”加载全部源头。</p></div>
+
+  <h3 id="chainTitle">链条详情</h3>
+  <p>
+    检疫员 <input id="quarantineUser" value="quarantine-1" size="14">
+    <span class="muted">对“隔离中（阳性）”批次点击“隔离下游”可批量隔离全部下游批次；已销毁、已放行或已隔离的自动跳过。</span>
+  </p>
+  <div id="chainDetail"><p class="muted">请选择上方任一源头查看整条链条。</p></div>
+
   <h2>常用接口</h2>
   <pre>GET  /health
 GET  /api/&lt;kind&gt;
 POST /api/&lt;kind&gt;
 GET  /api/entities/&lt;id&gt;
-POST /api/entities/&lt;id&gt;/actions</pre>
+POST /api/entities/&lt;id&gt;/actions
+GET  /api/trace
+GET  /api/trace/&lt;id&gt;
+POST /api/trace/&lt;id&gt;/quarantine</pre>
+  <pre id="result">等待操作</pre>
 </main>
 <script>
+const STATUS_ZH = {declared: '已申报', inspected: '已检验', quarantined: '隔离中', released: '已放行', destroyed: '已销毁'};
+let currentRoot = null;
+
+function show(data) {
+  document.getElementById('result').textContent = JSON.stringify(data, null, 2);
+}
+
+function statusText(status) {
+  return (STATUS_ZH[status] || status) + ' (' + status + ')';
+}
+
+function statusNode(status) {
+  const span = document.createElement('span');
+  span.textContent = statusText(status);
+  span.className = 'status-' + status;
+  return span;
+}
+
+function makeTable(headers, rows) {
+  const table = document.createElement('table');
+  const head = document.createElement('tr');
+  headers.forEach(function (text) {
+    const th = document.createElement('th');
+    th.textContent = text;
+    head.appendChild(th);
+  });
+  table.appendChild(head);
+  rows.forEach(function (cells) {
+    const tr = document.createElement('tr');
+    cells.forEach(function (value) {
+      const td = document.createElement('td');
+      if (value instanceof Node) {
+        td.appendChild(value);
+      } else {
+        td.textContent = value;
+      }
+      tr.appendChild(td);
+    });
+    table.appendChild(tr);
+  });
+  return table;
+}
+
 async function checkHealth() {
   const response = await fetch('/health');
-  document.getElementById('result').textContent = JSON.stringify(await response.json(), null, 2);
+  show(await response.json());
 }
+
+async function loadChains() {
+  const response = await fetch('/api/trace');
+  const data = await response.json();
+  const container = document.getElementById('chains');
+  container.innerHTML = '';
+  if (!data.items || !data.items.length) {
+    container.textContent = '暂无批次。';
+    return;
+  }
+  const rows = data.items.map(function (item) {
+    const button = document.createElement('button');
+    button.textContent = '查看链条';
+    button.onclick = function () { loadChain(item.id); };
+    return [
+      item.code || item.id,
+      statusNode(item.status),
+      (item.origin || '') + ' → ' + (item.destination || ''),
+      String(item.downstream_count),
+      button
+    ];
+  });
+  container.appendChild(makeTable(['源头批次', '当前状态', '来源 → 去向', '下游数量', ''], rows));
+  document.getElementById('chainsHint').textContent =
+    '共 ' + data.items.length + ' 条传播链（没有历史来源的旧批次按独立起点显示）';
+}
+
+async function loadChain(id) {
+  const response = await fetch('/api/trace/' + id);
+  const data = await response.json();
+  if (!response.ok) {
+    show(data);
+    return;
+  }
+  currentRoot = data.root_id;
+  const rootCode = data.items[0] ? (data.items[0].code || data.root_id) : data.root_id;
+  document.getElementById('chainTitle').textContent =
+    '链条详情（源头 ' + rootCode + '，共 ' + data.total + ' 个批次）';
+  const container = document.getElementById('chainDetail');
+  container.innerHTML = '';
+  const rows = data.items.map(function (item) {
+    let actionCell = document.createElement('span');
+    actionCell.className = 'muted';
+    if (item.status === 'quarantined') {
+      actionCell = document.createElement('button');
+      actionCell.textContent = '隔离下游';
+      actionCell.onclick = function () { bulkQuarantine(item.id); };
+    }
+    return [
+      '　'.repeat(item.depth) + (item.depth ? '└ ' : '') + (item.code || item.id),
+      statusNode(item.status),
+      (item.origin || '') + ' → ' + (item.destination || ''),
+      String(item.downstream_count),
+      item.pest_found ? '阳性' : '',
+      actionCell
+    ];
+  });
+  container.appendChild(makeTable(['批次', '当前状态', '来源 → 去向', '下游数量', '检出', '批量隔离'], rows));
+  show(data);
+}
+
+async function bulkQuarantine(id) {
+  const user = document.getElementById('quarantineUser').value || 'quarantine-1';
+  const response = await fetch('/api/trace/' + id + '/quarantine', {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      'X-User-Id': user,
+      'X-Role': 'quarantine'
+    },
+    body: JSON.stringify({reason: '页面批量隔离'})
+  });
+  const data = await response.json();
+  show(data);
+  if (response.ok) {
+    await loadChain(id);
+    await loadChains();
+  }
+}
+
+loadChains();
 </script>
 </body>
 </html>

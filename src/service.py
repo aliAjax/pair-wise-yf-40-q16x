@@ -2,7 +2,13 @@ from uuid import uuid4
 
 from .audit import AuditTrail
 from .domain import ConflictError, NotFoundError
-from .rules import RuleEngine
+from .rules import (
+    BULK_QUARANTINE_SKIP,
+    RuleEngine,
+    build_chain,
+    list_chain_roots,
+    plan_bulk_quarantine,
+)
 
 
 class DomainService:
@@ -68,6 +74,68 @@ class DomainService:
         if kind:
             kind = self.rules.normalize_kind(kind)
         return self.repository.list_entities(kind=kind, status=status)
+
+    def list_chains(self):
+        consignments = self.repository.list_entities(kind="consignment")
+        return list_chain_roots(consignments)
+
+    def trace_chain(self, entity_id):
+        entity = self.repository.get_entity(entity_id)
+        if not entity or entity["kind"] != "consignment":
+            raise NotFoundError("consignment not found: " + entity_id)
+        consignments = self.repository.list_entities(kind="consignment")
+        return build_chain(consignments, entity_id)
+
+    def quarantine_downstream(self, actor, entity_id, data=None):
+        entity = self.repository.get_entity(entity_id)
+        if not entity:
+            raise NotFoundError("entity not found: " + entity_id)
+        payload = dict(data or {})
+        consignments = self.repository.list_entities(kind="consignment")
+        plan = plan_bulk_quarantine(actor, entity, consignments)
+        reason = payload.get("reason") or "upstream pest positive"
+        quarantined = []
+        for item in plan["quarantine"]:
+            current = self.repository.get_entity(item["id"])
+            if not current or current["status"] in BULK_QUARANTINE_SKIP:
+                continue
+            patch = {
+                "quarantined_by": actor.user_id,
+                "quarantine_reason": reason,
+                "bulk_source": entity_id,
+            }
+            if payload.get("sample_id"):
+                patch["sample_id"] = payload["sample_id"]
+            merged = dict(current["data"])
+            merged.update(patch)
+            self.repository.update_entity(
+                current["id"], current["version"], "quarantined", merged
+            )
+            self.audit.record(
+                current["id"],
+                actor,
+                "quarantine_downstream",
+                current["status"],
+                "quarantined",
+                {"patch": patch, "source_id": entity_id},
+            )
+            quarantined.append(
+                {
+                    "id": current["id"],
+                    "code": item.get("code"),
+                    "from_status": current["status"],
+                    "status": "quarantined",
+                }
+            )
+        return {
+            "action": "quarantine_downstream",
+            "source_id": entity_id,
+            "chain_total": len(plan["order"]),
+            "downstream_total": max(len(plan["order"]) - 1, 0),
+            "quarantined_count": len(quarantined),
+            "quarantined": quarantined,
+            "skipped": plan["skipped"],
+        }
 
     def audit_log(self, entity_id=None):
         return self.repository.list_audit(entity_id=entity_id)

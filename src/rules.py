@@ -11,6 +11,28 @@ from .domain import (
 def _validate_consignment(actor, data, lookup):
     if data.get("origin") == data.get("destination"):
         raise ValidationError("origin and destination must differ")
+    parent_id = data.get("parent_id")
+    if parent_id in (None, ""):
+        return
+    if not isinstance(parent_id, str):
+        raise ValidationError("parent_id must be a string")
+    if parent_id == data.get("id"):
+        raise ValidationError("parent_id cannot reference the consignment itself")
+    parent = _find_one(lookup, "consignment", "id", parent_id)
+    if parent is None:
+        raise ValidationError("parent consignment not found: " + parent_id)
+    new_id = data.get("id")
+    if new_id:
+        seen = {new_id, parent_id}
+        node = parent
+        while node:
+            ancestor = (node.get("data") or {}).get("parent_id")
+            if not ancestor:
+                break
+            if ancestor in seen:
+                raise ValidationError("parent_id would create a cycle")
+            seen.add(ancestor)
+            node = _find_one(lookup, "consignment", "id", ancestor)
 
 
 def _validate_quarantine(actor, entity, data, lookup):
@@ -41,6 +63,161 @@ def trace_downstream(consignments, start_id):
             if item.get("parent_id") == current:
                 pending.append(item.get("id"))
     return result
+
+
+def find_root_id(links, start_id):
+    """Walk parent links upward to the ultimate source id (cycle-safe)."""
+    by_id = {link.get("id"): link for link in links}
+    current = start_id
+    visited = set()
+    while current and current not in visited:
+        visited.add(current)
+        link = by_id.get(current)
+        if not link:
+            break
+        parent = link.get("parent_id")
+        if not parent or parent not in by_id:
+            break
+        current = parent
+    return current
+
+
+def _children_map(consignments):
+    children = {}
+    for entity in consignments:
+        parent = (entity.get("data") or {}).get("parent_id")
+        children.setdefault(parent, []).append(entity)
+    for group in children.values():
+        group.sort(key=lambda item: (item.get("created_at") or "", item.get("id") or ""))
+    return children
+
+
+def _descendant_counts(consignments):
+    """Total transitive downstream count for every consignment."""
+    children = _children_map(consignments)
+    counts = {}
+
+    def measure(node_id, stack):
+        if node_id in counts:
+            return counts[node_id]
+        if node_id in stack:
+            return 0
+        stack.add(node_id)
+        total = 0
+        for child in children.get(node_id, []):
+            total += 1 + measure(child.get("id"), stack)
+        stack.discard(node_id)
+        counts[node_id] = total
+        return total
+
+    for entity in consignments:
+        measure(entity.get("id"), set())
+    return counts
+
+
+def _chain_summary(entity, counts):
+    data = entity.get("data") or {}
+    return {
+        "id": entity.get("id"),
+        "code": data.get("code"),
+        "status": entity.get("status"),
+        "parent_id": data.get("parent_id"),
+        "origin": data.get("origin"),
+        "destination": data.get("destination"),
+        "pest_found": bool(data.get("pest_found")),
+        "downstream_count": counts.get(entity.get("id"), 0),
+        "updated_at": entity.get("updated_at"),
+    }
+
+
+def list_chain_roots(consignments):
+    """Roots are consignments without a known parent — legacy ones included."""
+    known = {entity.get("id") for entity in consignments}
+    counts = _descendant_counts(consignments)
+    roots = []
+    for entity in consignments:
+        parent = (entity.get("data") or {}).get("parent_id")
+        if parent and parent in known:
+            continue
+        roots.append(_chain_summary(entity, counts))
+    return roots
+
+
+def build_chain(consignments, start_id):
+    """Resolve the source of start_id and return the whole downstream chain."""
+    by_id = {entity.get("id"): entity for entity in consignments}
+    links = [
+        {"id": entity.get("id"), "parent_id": (entity.get("data") or {}).get("parent_id")}
+        for entity in consignments
+    ]
+    root_id = find_root_id(links, start_id)
+    children = _children_map(consignments)
+    counts = _descendant_counts(consignments)
+    items = []
+    visited = set()
+    queue = [(root_id, 0)]
+    while queue:
+        current, depth = queue.pop(0)
+        if current in visited or current not in by_id:
+            continue
+        visited.add(current)
+        summary = _chain_summary(by_id[current], counts)
+        summary["depth"] = depth
+        items.append(summary)
+        for child in children.get(current, []):
+            queue.append((child.get("id"), depth + 1))
+    return {
+        "root_id": root_id,
+        "queried_id": start_id,
+        "total": len(items),
+        "items": items,
+    }
+
+
+BULK_QUARANTINE_ROLES = ("admin", "quarantine")
+BULK_QUARANTINE_SKIP = {
+    "quarantined": "already quarantined",
+    "released": "already released",
+    "destroyed": "already destroyed",
+}
+
+
+def plan_bulk_quarantine(actor, source, consignments):
+    """Split the source's downstream chain into quarantine targets and skips.
+
+    Destroyed, released or already quarantined batches must not be touched.
+    """
+    if source.get("kind") != "consignment":
+        raise ValidationError("bulk quarantine source must be a consignment")
+    RuleEngine._ensure_role(actor, BULK_QUARANTINE_ROLES)
+    if source.get("status") != "quarantined":
+        raise InvalidTransition(
+            "source must be quarantined before downstream quarantine, current status: %s"
+            % source.get("status")
+        )
+    by_id = {entity.get("id"): entity for entity in consignments}
+    links = [
+        {"id": entity.get("id"), "parent_id": (entity.get("data") or {}).get("parent_id")}
+        for entity in consignments
+    ]
+    order = trace_downstream(links, source.get("id"))
+    to_quarantine = []
+    skipped = []
+    for consignment_id in order:
+        entity = by_id.get(consignment_id)
+        if entity is None:
+            continue
+        entry = {
+            "id": consignment_id,
+            "code": (entity.get("data") or {}).get("code"),
+            "status": entity.get("status"),
+        }
+        reason = BULK_QUARANTINE_SKIP.get(entity.get("status"))
+        if reason:
+            skipped.append(dict(entry, reason=reason))
+        else:
+            to_quarantine.append(entry)
+    return {"order": order, "quarantine": to_quarantine, "skipped": skipped}
 
 
 CUSTOM_CREATE = {'consignment': _validate_consignment}

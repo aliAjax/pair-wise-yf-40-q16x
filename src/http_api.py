@@ -85,6 +85,12 @@ def create_handler(service, rules, static_dir):
                         return self._send_html(200, handle.read())
                 if parts == ["api", "audit"]:
                     return self._send(200, {"items": service.audit_log()})
+                if len(parts) >= 2 and parts[:2] == ["api", "trace"]:
+                    if len(parts) == 2:
+                        return self._send(200, {"items": service.list_chains()})
+                    if len(parts) == 3:
+                        return self._send(200, service.trace_chain(parts[2]))
+                    raise NotFoundError("not found")
                 if len(parts) == 3 and parts[:2] == ["api", "entities"]:
                     return self._send(200, service.get(parts[2]))
                 if len(parts) >= 2 and parts[0] == "api":
@@ -107,6 +113,15 @@ def create_handler(service, rules, static_dir):
                 parsed = urlparse(self.path)
                 parts = [part for part in parsed.path.split("/") if part]
                 actor = self._actor()
+                if (
+                    len(parts) == 4
+                    and parts[:2] == ["api", "trace"]
+                    and parts[3] == "quarantine"
+                ):
+                    return self._send(
+                        200,
+                        service.quarantine_downstream(actor, parts[2], self._body()),
+                    )
                 if len(parts) == 3 and parts[:2] == ["api", "entities"]:
                     body = self._body()
                     action = body.pop("action", None)
