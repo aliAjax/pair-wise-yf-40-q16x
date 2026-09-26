@@ -25,6 +25,7 @@ python3 app.py --db ./data.db --port 8306
 ## 核心对象
 
 - `consignment`：检疫批次；`facility`：温室、苗圃或下游种植点。
+- 创建批次时可传可选字段`parent_id`（来源批次 id），把批次串成传播链；去向由挂到本批次的下游批次推导。没有`parent_id`的旧批次按独立起点显示。
 
 ## 主要接口
 
@@ -33,7 +34,12 @@ python3 app.py --db ./data.db --port 8306
 - `POST /api/<kind>`：创建对象；请求体为JSON。
 - `GET /api/entities/<id>`：读取对象当前版本。
 - `POST /api/entities/<id>/actions`：提交`{"action":"动作名","data":{...},"expected_version":数字}`。
+- `GET /api/chains`：按源头列出全部传播链，含每个批次的当前状态和下游数量。
+- `GET /api/chains/<id>`：查看以某批次为起点的整条链条。
+- `POST /api/chains/<id>/quarantine`：发现阳性后按源头批量隔离整条链；已销毁或已解除隔离的批次自动跳过，结果分`isolated`/`skipped`返回。
 - `GET /api/audit`：读取审计记录。
+
+批量隔离通过`isolate`动作（`declared`/`inspected` → `quarantined`，需`reason`字段，角色`admin`/`quarantine`）逐批执行，每次隔离都写入审计并记录`chain_root`，服务重启后链条视图和台账仍然可查。
 
 请求身份通过`X-User-Id`和`X-Role`请求头传入。创建和动作的可执行角色由规则引擎控制。
 

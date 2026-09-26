@@ -85,6 +85,10 @@ def create_handler(service, rules, static_dir):
                         return self._send_html(200, handle.read())
                 if parts == ["api", "audit"]:
                     return self._send(200, {"items": service.audit_log()})
+                if parts == ["api", "chains"]:
+                    return self._send(200, {"items": service.chains()})
+                if len(parts) == 3 and parts[:2] == ["api", "chains"]:
+                    return self._send(200, service.chain(parts[2]))
                 if len(parts) == 3 and parts[:2] == ["api", "entities"]:
                     return self._send(200, service.get(parts[2]))
                 if len(parts) >= 2 and parts[0] == "api":
@@ -107,6 +111,12 @@ def create_handler(service, rules, static_dir):
                 parsed = urlparse(self.path)
                 parts = [part for part in parsed.path.split("/") if part]
                 actor = self._actor()
+                if len(parts) == 4 and parts[:2] == ["api", "chains"] and parts[3] == "quarantine":
+                    body = self._body()
+                    return self._send(
+                        200,
+                        service.quarantine_chain(actor, parts[2], reason=body.get("reason")),
+                    )
                 if len(parts) == 3 and parts[:2] == ["api", "entities"]:
                     body = self._body()
                     action = body.pop("action", None)

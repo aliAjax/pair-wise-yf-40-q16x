@@ -11,6 +11,12 @@ from .domain import (
 def _validate_consignment(actor, data, lookup):
     if data.get("origin") == data.get("destination"):
         raise ValidationError("origin and destination must differ")
+    parent_id = data.get("parent_id")
+    if parent_id:
+        if data.get("id") == parent_id:
+            raise ValidationError("parent_id must differ from id")
+        if not _find_one(lookup, "consignment", "id", parent_id):
+            raise ValidationError("parent consignment not found: " + str(parent_id))
 
 
 def _validate_quarantine(actor, entity, data, lookup):
@@ -25,6 +31,10 @@ def _validate_release(actor, entity, data, lookup):
     if data.get("treatment") not in ("none", "completed", "certified"):
         raise ValidationError("release requires a valid treatment state")
     return {"released_by": actor.user_id}
+
+
+def _validate_isolate(actor, entity, data, lookup):
+    return {"isolated_by": actor.user_id}
 
 
 def trace_downstream(consignments, start_id):
@@ -43,18 +53,56 @@ def trace_downstream(consignments, start_id):
     return result
 
 
+def chain_links(consignments):
+    """Flatten consignment entities into id/parent_id link dicts."""
+    links = []
+    for entity in consignments:
+        data = entity.get("data") or {}
+        links.append({"id": entity.get("id"), "parent_id": data.get("parent_id")})
+    return links
+
+
+def chain_roots(links):
+    """Ids with no known parent: independent chain starts (incl. legacy batches)."""
+    known = {link.get("id") for link in links}
+    return [
+        link.get("id")
+        for link in links
+        if not link.get("parent_id") or link.get("parent_id") not in known
+    ]
+
+
+def downstream_counts(links):
+    """Total transitive downstream batch count per consignment id."""
+    children = {}
+    for link in links:
+        children.setdefault(link.get("parent_id"), []).append(link.get("id"))
+    counts = {}
+    for link in links:
+        seen = set()
+        queue = list(children.get(link.get("id"), ()))
+        while queue:
+            current = queue.pop(0)
+            if current in seen:
+                continue
+            seen.add(current)
+            queue.extend(children.get(current, ()))
+        counts[link.get("id")] = len(seen)
+    return counts
+
+
 CUSTOM_CREATE = {'consignment': _validate_consignment}
-CUSTOM_TRANSITIONS = {('consignment', 'quarantine'): _validate_quarantine, ('consignment', 'release'): _validate_release}
+CUSTOM_TRANSITIONS = {('consignment', 'quarantine'): _validate_quarantine, ('consignment', 'release'): _validate_release, ('consignment', 'isolate'): _validate_isolate}
 
 
 class RuleEngine:
     ALIASES = {'consignments': 'consignment', 'facilities': 'facility'}
     INITIAL_STATUS = {'consignment': 'declared', 'facility': 'registered'}
-    TRANSITIONS = {'consignment': {'inspect': (('declared',), 'inspected'), 'quarantine': (('inspected',), 'quarantined'), 'release': (('inspected',), 'released'), 'destroy': (('quarantined',), 'destroyed'), 'recheck': (('quarantined',), 'inspected')}, 'facility': {'trace': (('registered',), 'traced')}}
+    TRANSITIONS = {'consignment': {'inspect': (('declared',), 'inspected'), 'quarantine': (('inspected',), 'quarantined'), 'release': (('inspected',), 'released'), 'destroy': (('quarantined',), 'destroyed'), 'recheck': (('quarantined',), 'inspected'), 'isolate': (('declared', 'inspected'), 'quarantined')}, 'facility': {'trace': (('registered',), 'traced')}}
     CREATE_REQUIRED = {'consignment': ('code', 'origin', 'destination'), 'facility': ('name', 'address')}
-    ACTION_REQUIRED = {('consignment', 'inspect'): ('inspector', 'inspection_result'), ('consignment', 'quarantine'): ('pest_found', 'sample_id'), ('consignment', 'release'): ('pest_found', 'treatment'), ('consignment', 'destroy'): ('method', 'witnessed_by'), ('consignment', 'recheck'): ('sample_id',), ('facility', 'trace'): ('consignment_ids',)}
+    ACTION_REQUIRED = {('consignment', 'inspect'): ('inspector', 'inspection_result'), ('consignment', 'quarantine'): ('pest_found', 'sample_id'), ('consignment', 'release'): ('pest_found', 'treatment'), ('consignment', 'destroy'): ('method', 'witnessed_by'), ('consignment', 'recheck'): ('sample_id',), ('consignment', 'isolate'): ('reason',), ('facility', 'trace'): ('consignment_ids',)}
     CREATE_ROLES = {'consignment': ('admin', 'inspector'), 'facility': ('admin', 'quarantine')}
-    ROLE_ACTIONS = {'inspect': ('admin', 'inspector'), 'quarantine': ('admin', 'quarantine'), 'release': ('admin', 'quarantine'), 'destroy': ('admin', 'quarantine'), 'recheck': ('admin', 'inspector'), 'trace': ('admin', 'quarantine')}
+    ROLE_ACTIONS = {'inspect': ('admin', 'inspector'), 'quarantine': ('admin', 'quarantine'), 'release': ('admin', 'quarantine'), 'destroy': ('admin', 'quarantine'), 'recheck': ('admin', 'inspector'), 'isolate': ('admin', 'quarantine'), 'trace': ('admin', 'quarantine')}
 
     def normalize_kind(self, kind):
         return self.ALIASES.get(kind, kind)
